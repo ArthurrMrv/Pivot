@@ -1,4 +1,9 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from 'react'
+import { ingestFiles, uploadDoc } from './lib/api'
+import { useNotes } from './lib/useNotes'
+import { useIngest } from './lib/useIngest'
+import { batchPhase, PHASE_LABEL } from './lib/phase'
+import type { IngestItem } from './lib/types'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 interface NoteDoc {
@@ -6,7 +11,8 @@ interface NoteDoc {
   name: string
   ext: string   // 'pdf' | 'md' | 'png' | 'docx' | etc.
   size: number  // bytes
-  preview?: string // object URL for images
+  preview?: string // signed URL, images only
+  url?: string     // signed URL, any document — the card opens it
 }
 interface Note {
   id: string
@@ -19,21 +25,6 @@ interface Note {
 type NodeKind = 'note' | 'tag'
 interface GNode { id: string; name: string; kind: NodeKind; x: number; y: number; vx: number; vy: number; degree: number }
 interface GLink { source: string; target: string }
-
-// ─── Seed ─────────────────────────────────────────────────────────────────────
-const SEED: Note[] = [
-  { id: 'n1', name: 'Why I started this brain', content: `# Why I started this brain\n\nI kept losing good ideas between apps, browser tabs and notebooks.\n\nThis is a single place to capture everything and let connections emerge.\n\n#meta #reflection\n\nRelated: [[Zettelkasten]], [[How to take better notes]]`, created: Date.now() - 86400000 * 4, modified: Date.now() - 86400000 * 2 },
-  { id: 'n2', name: 'How to take better notes', content: `# How to take better notes\n\nThe goal is not to store information — it's to think better.\n\n#learning #pkm\n\n## Principles\n\n- One idea per note\n- Write in your own words\n- Link aggressively\n\nSee: [[Zettelkasten]], [[Why I started this brain]]`, created: Date.now() - 86400000 * 3, modified: Date.now() - 86400000 },
-  { id: 'n3', name: 'Zettelkasten', content: `# Zettelkasten\n\nNiklas Luhmann's slip-box method. 90,000 notes, 70 books.\n\n#pkm #method\n\nAtomic notes + dense linking = emergent insight.\n\nRelated: [[How to take better notes]], [[Why I started this brain]]`, created: Date.now() - 86400000 * 2, modified: Date.now() - 3600000 * 5, docs: [
-    { id: 'd1', name: 'Luhmann - Kommunikation mit Zettelkästen.pdf', ext: 'pdf', size: 842000 },
-    { id: 'd2', name: 'How to Take Smart Notes - Ahrens.pdf', ext: 'pdf', size: 2100000 },
-    { id: 'd3', name: 'zettelkasten-intro-notes.md', ext: 'md', size: 14400 },
-  ]},
-  { id: 'n4', name: 'Reading list', content: `# Reading list\n\n#learning #books\n\n- [ ] How to Take Smart Notes — Sönke Ahrens\n- [ ] Building a Second Brain — Tiago Forte\n- [x] Deep Work — Cal Newport\n\nSee: [[How to take better notes]]`, created: Date.now() - 86400000, modified: Date.now() - 3600000 * 2, docs: [
-    { id: 'd4', name: 'deep-work-highlights.pdf', ext: 'pdf', size: 380000 },
-  ]},
-  { id: 'n5', name: 'Product ideas', content: `# Product ideas\n\n#ideas #projects\n\n- AI that surfaces old notes when relevant\n- Graph search across multiple vaults\n- Voice capture → auto-transcribe\n\nRelated: [[Why I started this brain]]`, created: Date.now() - 3600000 * 8, modified: Date.now() - 3600000 },
-]
 
 // ─── Utils ────────────────────────────────────────────────────────────────────
 const extractTags = (c: string) => [...new Set([...c.matchAll(/#([\w-]+)/g)].map(m => m[1]))]
@@ -294,6 +285,14 @@ function InlineSearch({ notes, onSelect, onHoverNote, inputRef: externalRef }: {
   )
 }
 
+// Note dots are fixed; a tag grows with its links but flattens out — sqrt, so
+// the 20th link adds a hair and nothing can dwarf the canvas.
+const NOTE_R = 5
+const TAG_R_MIN = 7
+const TAG_R_MAX = 14
+const tagRadius = (degree: number) =>
+  Math.min(TAG_R_MAX, TAG_R_MIN + Math.sqrt(Math.max(0, degree)) * 2)
+
 // ─── Graph ────────────────────────────────────────────────────────────────────
 function GraphCanvas({ notes, focusId, searchHoverId, onNodeClick }: {
   notes: Note[]
@@ -308,17 +307,21 @@ function GraphCanvas({ notes, focusId, searchHoverId, onNodeClick }: {
   const [hovered, setHovered] = useState('')
   const [pos, setPos] = useState<Map<string, { x: number; y: number }>>(new Map())
   const dragStart = useRef<{ ox: number; oy: number } | null>(null)
+  const dragged = useRef(false)
+  const [sel, setSel] = useState<string[]>([])   // shift-click multi-select
 
   const { nodes, links } = useMemo(() => {
     const ns: GNode[] = notes.map(n => ({ id: n.id, name: n.name, kind: 'note', x: 0, y: 0, vx: 0, vy: 0, degree: 0 }))
-    const tagMap = new Map<string, string[]>()
+    const byTag = new Map<string, string[]>()
     notes.forEach(n => extractTags(n.content).forEach(t => {
       const tid = `t:${t}`
-      if (!tagMap.has(tid)) tagMap.set(tid, [])
-      tagMap.get(tid)!.push(n.id)
+      if (!byTag.has(tid)) byTag.set(tid, [])
+      byTag.get(tid)!.push(n.id)
     }))
+    // A tag on a single note connects nothing — it is clutter, not structure.
+    const tagMap = new Map([...byTag].filter(([, ids]) => ids.length > 1))
     const tn: GNode[] = []
-    tagMap.forEach((_, tid) => tn.push({ id: tid, name: tid.replace('t:', '#'), kind: 'tag', x: 0, y: 0, vx: 0, vy: 0, degree: 0 }))
+    tagMap.forEach((_, tid) => tn.push({ id: tid, name: tid.slice(2), kind: 'tag', x: 0, y: 0, vx: 0, vy: 0, degree: 0 }))
     const all = [...ns, ...tn]
     const ls: GLink[] = []
     notes.forEach(n => extractLinks(n.content).forEach(ln => {
@@ -343,16 +346,27 @@ function GraphCanvas({ notes, focusId, searchHoverId, onNodeClick }: {
 
   useEffect(() => { setPos(runForce(nodes, links, dims.w, dims.h)) }, [nodes.length, links.length, dims.w, dims.h])
 
+  // Shift-click anchors win over the single focused node; with several, only
+  // what every one of them touches stays lit.
+  const anchors = useMemo(
+    () => new Set(sel.length ? sel.filter(id => nodes.some(n => n.id === id)) : focusId ? [focusId] : []),
+    [sel, focusId, nodes],
+  )
+
   const connected = useMemo(() => {
-    if (!focusId) return new Set<string>()
-    return new Set(links.filter(l => l.source === focusId || l.target === focusId).map(l => l.source === focusId ? l.target : l.source))
-  }, [focusId, links])
+    if (!anchors.size) return new Set<string>()
+    const sets = [...anchors].map(id => new Set(
+      links.filter(l => l.source === id || l.target === id).map(l => (l.source === id ? l.target : l.source)),
+    ))
+    return new Set([...sets[0]].filter(id => sets.every(s => s.has(id))))
+  }, [anchors, links])
 
   return (
     <div ref={wrapRef}
       style={{ width: '100%', height: '100%', position: 'relative', overflow: 'hidden', cursor: dragStart.current ? 'grabbing' : 'grab' }}
-      onMouseDown={e => { dragStart.current = { ox: e.clientX - pan.x, oy: e.clientY - pan.y } }}
-      onMouseMove={e => { if (dragStart.current) setPan({ x: e.clientX - dragStart.current.ox, y: e.clientY - dragStart.current.oy }) }}
+      onMouseDown={e => { dragStart.current = { ox: e.clientX - pan.x, oy: e.clientY - pan.y }; dragged.current = false }}
+      onMouseMove={e => { if (dragStart.current) { dragged.current = true; setPan({ x: e.clientX - dragStart.current.ox, y: e.clientY - dragStart.current.oy }) } }}
+      onClick={() => { if (!dragged.current) setSel([]) }}
       onMouseUp={() => { dragStart.current = null }}
       onMouseLeave={() => { dragStart.current = null }}
       onWheel={e => { e.preventDefault(); setZoom(z => Math.max(.25, Math.min(3.5, z * (e.deltaY > 0 ? .92 : 1.08)))) }}
@@ -374,7 +388,8 @@ function GraphCanvas({ notes, focusId, searchHoverId, onNodeClick }: {
             const sn = nodes.find(n => n.id === l.source)
             const tn = nodes.find(n => n.id === l.target)
             const isTag = sn?.kind === 'tag' || tn?.kind === 'tag'
-            const active = focusId && (l.source === focusId || l.target === focusId)
+            const active = (anchors.has(l.source) && (connected.has(l.target) || anchors.has(l.target)))
+              || (anchors.has(l.target) && (connected.has(l.source) || anchors.has(l.source)))
             const hov = hovered && (l.source === hovered || l.target === hovered)
             return (
               <line key={i} x1={s.x} y1={s.y} x2={t.x} y2={t.y}
@@ -388,8 +403,9 @@ function GraphCanvas({ notes, focusId, searchHoverId, onNodeClick }: {
           {nodes.map(node => {
             const p = pos.get(node.id); if (!p) return null
             const isNote = node.kind === 'note'
-            const r = isNote ? Math.max(7, 7 + node.degree * 1.5) : 5
-            const isFocus = node.id === focusId
+            // Tags are the topics; notes are subsections of one. Size says so.
+            const r = isNote ? NOTE_R : tagRadius(node.degree)
+            const isFocus = anchors.has(node.id)
             const isHov = node.id === hovered
             const isSearchHov = node.id === searchHoverId
             const isConn = connected.has(node.id)
@@ -401,7 +417,11 @@ function GraphCanvas({ notes, focusId, searchHoverId, onNodeClick }: {
               : (isNote ? '#ddd8fd' : '#bbf7d0')
             return (
               <g key={node.id}
-                onClick={() => onNodeClick(node.id)}
+                onClick={e => {
+                  e.stopPropagation()   // the background clears the selection
+                  if (e.shiftKey) setSel(s => s.includes(node.id) ? s.filter(x => x !== node.id) : [...s, node.id])
+                  else onNodeClick(node.id)   // opening a note leaves the selection alone
+                }}
                 onMouseEnter={() => setHovered(node.id)}
                 onMouseLeave={() => setHovered('')}
                 style={{ cursor: 'pointer' }}
@@ -412,7 +432,7 @@ function GraphCanvas({ notes, focusId, searchHoverId, onNodeClick }: {
                 {(isFocus || isHov || isSearchHov) && <circle cx={p.x} cy={p.y} r={r * .35} fill="#fff" opacity={.9} />}
                 <text x={p.x} y={p.y + r + 14} textAnchor="middle"
                   fill={isFocus ? '#312e81' : isSearchHov ? '#312e81' : isConn ? '#475569' : isHov ? '#334155' : '#94a3b8'}
-                  fontSize={isNote ? 11 : 10} fontFamily="Inter,sans-serif" fontWeight={isFocus || isSearchHov ? 600 : 400}
+                  fontSize={isNote ? 10 : 12} fontFamily="Inter,sans-serif" fontWeight={isFocus || isSearchHov ? 600 : 400}
                   style={{ pointerEvents: 'none' }}
                 >{node.name}</text>
               </g>
@@ -445,13 +465,15 @@ const docIcon = (ext: string) => DOC_ICONS[ext.toLowerCase()] ?? { bg: '#f5f4f0'
 const fmtSize = (b: number) => b > 1e6 ? `${(b/1e6).toFixed(1)} MB` : `${Math.round(b/1024)} KB`
 const shortName = (name: string, max = 22) => name.length > max ? name.slice(0, max - 1) + '…' : name
 
-function DocCarousel({ docs, onAddDoc, px }: {
+function DocCarousel({ docs, noteId, onAddDoc, px }: {
   docs: NoteDoc[]
+  noteId: string
   onAddDoc: (doc: NoteDoc) => void
   px: string
 }) {
   const scrollRef = useRef<HTMLDivElement>(null)
   const fileRef = useRef<HTMLInputElement>(null)
+  const [err, setErr] = useState<string | null>(null)
 
   const scroll = (dir: 'left' | 'right') => {
     const el = scrollRef.current; if (!el) return
@@ -460,14 +482,12 @@ function DocCarousel({ docs, onAddDoc, px }: {
 
   const handleFiles = (fl: FileList | null) => {
     if (!fl) return
+    setErr(null)
     Array.from(fl).forEach(f => {
-      const ext = f.name.split('.').pop() ?? 'bin'
-      const doc: NoteDoc = {
-        id: `d${Date.now()}-${Math.random().toString(36).slice(2)}`,
-        name: f.name, ext, size: f.size,
-        preview: f.type.startsWith('image/') ? URL.createObjectURL(f) : undefined,
-      }
-      onAddDoc(doc)
+      uploadDoc(noteId, f).then(onAddDoc).catch(e => {
+        console.error('could not attach document:', e)
+        setErr(e instanceof Error ? e.message : String(e))
+      })
     })
   }
 
@@ -489,8 +509,8 @@ function DocCarousel({ docs, onAddDoc, px }: {
   return (
     <div style={{ padding: `12px ${px}`, borderTop: '1px solid #f5f4f0', flexShrink: 0 }}>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>
-        <div style={{ fontSize: 10, color: '#cbd5e1', textTransform: 'uppercase', letterSpacing: '.08em' }}>
-          Documents{docs.length > 0 ? ` · ${docs.length}` : ''}
+        <div style={{ fontSize: 10, color: err ? '#ef4444' : '#cbd5e1', textTransform: 'uppercase', letterSpacing: '.08em' }}>
+          {err ?? `Documents${docs.length > 0 ? ` · ${docs.length}` : ''}`}
         </div>
         <div style={{ display: 'flex', gap: 3 }}>
           {[['←', 'left'], ['→', 'right']].map(([label, dir]) => (
@@ -507,7 +527,9 @@ function DocCarousel({ docs, onAddDoc, px }: {
         {docs.map(doc => {
           const ic = docIcon(doc.ext)
           return (
-            <div key={doc.id} style={{ flexShrink: 0, width: 130, scrollSnapAlign: 'start', background: '#fafaf9', border: '1px solid #f1f0ec', borderRadius: 10, padding: '10px 10px 9px', display: 'flex', flexDirection: 'column', gap: 7 }}>
+            <div key={doc.id} onClick={() => doc.url && window.open(doc.url, '_blank', 'noopener')}
+              title={doc.url ? `Open ${doc.name}` : doc.name}
+              style={{ flexShrink: 0, width: 130, scrollSnapAlign: 'start', background: '#fafaf9', border: '1px solid #f1f0ec', borderRadius: 10, padding: '10px 10px 9px', display: 'flex', flexDirection: 'column', gap: 7, cursor: doc.url ? 'pointer' : 'default' }}>
               <div style={{ width: '100%', height: 60, borderRadius: 6, background: ic.bg, display: 'flex', alignItems: 'center', justifyContent: 'center', overflow: 'hidden', flexShrink: 0 }}>
                 {doc.preview
                   ? <img src={doc.preview} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
@@ -542,11 +564,24 @@ function DocCarousel({ docs, onAddDoc, px }: {
   )
 }
 
+const confirmDelete = (name: string) =>
+  window.confirm(`Delete “${name}”? Its attached documents go with it. This cannot be undone.`)
+
+function DeleteButton({ onClick, small }: { onClick: () => void; small?: boolean }) {
+  return (
+    <button onClick={onClick} title="Delete note"
+      style={{ padding: small ? '4px 10px' : '5px 12px', fontSize: small ? 11 : 12, background: '#fef2f2', border: '1px solid #fecaca', borderRadius: small ? 6 : 7, color: '#dc2626', cursor: 'pointer', fontFamily: 'inherit', fontWeight: 500, flexShrink: 0 }}>
+      Delete
+    </button>
+  )
+}
+
 // ─── Note card (slide-in panel) ───────────────────────────────────────────────
-function NoteCard({ note, notes, isMobile, onClose, onNavigate, onUpdate, onAddDoc }: {
+function NoteCard({ note, notes, isMobile, onClose, onNavigate, onUpdate, onDelete, onAddDoc }: {
   note: Note | null; notes: Note[]; isMobile: boolean
   onClose: () => void; onNavigate: (id: string) => void
   onUpdate: (id: string, c: string) => void
+  onDelete: (id: string) => void
   onAddDoc: (noteId: string, doc: NoteDoc) => void
 }) {
   const [editing, setEditing] = useState(false)
@@ -589,6 +624,7 @@ function NoteCard({ note, notes, isMobile, onClose, onNavigate, onUpdate, onAddD
               </h2>
               {!isMobile && (
                 <div style={{ display: 'flex', gap: 4, flexShrink: 0, marginTop: 2 }}>
+                  {editing && <DeleteButton small onClick={() => confirmDelete(note.name) && onDelete(note.id)} />}
                   <button onClick={() => setEditing(e => !e)}
                     style={{ padding: '4px 10px', fontSize: 11, background: editing ? '#eef2ff' : '#f5f4f0', border: '1px solid ' + (editing ? '#c7d2fe' : '#e9e8e4'), borderRadius: 6, color: editing ? '#4f46e5' : '#94a3b8', cursor: 'pointer', fontFamily: 'inherit', fontWeight: 500 }}>
                     {editing ? 'Preview' : 'Edit'}
@@ -602,6 +638,7 @@ function NoteCard({ note, notes, isMobile, onClose, onNavigate, onUpdate, onAddD
               <div style={{ marginTop: 10 }}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                   <h2 style={{ margin: 0, fontSize: 20, fontWeight: 650, color: '#0f0e0d', letterSpacing: '-.025em', lineHeight: 1.3, flex: 1 }}>{note.name}</h2>
+                  {editing && <DeleteButton onClick={() => confirmDelete(note.name) && onDelete(note.id)} />}
                   <button onClick={() => setEditing(e => !e)}
                     style={{ padding: '5px 12px', fontSize: 12, background: editing ? '#eef2ff' : '#f5f4f0', border: '1px solid ' + (editing ? '#c7d2fe' : '#e9e8e4'), borderRadius: 7, color: editing ? '#4f46e5' : '#94a3b8', cursor: 'pointer', fontFamily: 'inherit', fontWeight: 500, flexShrink: 0 }}>
                     {editing ? 'Preview' : 'Edit'}
@@ -633,6 +670,7 @@ function NoteCard({ note, notes, isMobile, onClose, onNavigate, onUpdate, onAddD
 
           <DocCarousel
             docs={note.docs ?? []}
+            noteId={note.id}
             onAddDoc={doc => onAddDoc(note.id, doc)}
             px={isMobile ? '18px' : '22px'}
           />
@@ -746,14 +784,18 @@ function SearchOverlay({ notes, onSelect, onClose }: {
 interface UFile { id: string; file: File; preview?: string }
 
 function CaptureSheet({ onClose, onSave }: {
-  onClose: () => void; onSave: (name: string, content: string) => void
+  onClose: () => void; onSave: (name: string, content: string) => Promise<void>
 }) {
   const [tab, setTab] = useState<'upload' | 'write'>('upload')
   const [title, setTitle] = useState('')
   const [body, setBody] = useState('')
   const [files, setFiles] = useState<UFile[]>([])
   const [dragging, setDragging] = useState(false)
-  const [done, setDone] = useState(false)
+  const [status, setStatus] = useState<{ ok: boolean; text: string } | null>(null)
+  const [busy, setBusy] = useState(false)
+  // Hashing, page rendering and uploading all happen before a batch row exists,
+  // so the progress tray cannot show them — this is that stretch.
+  const [phase, setPhase] = useState('')
   const fileInput = useRef<HTMLInputElement>(null)
 
   const addFiles = (fl: FileList | null) => {
@@ -761,19 +803,37 @@ function CaptureSheet({ onClose, onSave }: {
     setFiles(p => [...p, ...Array.from(fl).filter(f => !p.find(x => x.id === f.name + f.size)).map(f => ({
       id: f.name + f.size, file: f, preview: f.type.startsWith('image/') ? URL.createObjectURL(f) : undefined,
     }))])
-    setDone(false)
+    setStatus(null)
   }
 
-  const save = () => {
-    if (tab === 'write' && body.trim()) {
-      onSave(title.trim() || 'Untitled note', `# ${title.trim() || 'Untitled note'}\n\n${body.trim()}`)
-      onClose()
-    } else if (tab === 'upload' && files.length) {
-      setDone(true)
+  const save = async () => {
+    const fail = (e: unknown) => setStatus({ ok: false, text: e instanceof Error ? e.message : String(e) })
+    setBusy(true)
+    setPhase('')
+    try {
+      if (tab === 'write' && body.trim()) {
+        const name = title.trim() || 'Untitled note'
+        await onSave(name, `# ${name}\n\n${body.trim()}`)
+        onClose()
+      } else if (tab === 'upload' && files.length) {
+        const { queued, duplicates } = await ingestFiles(files.map(f => f.file), setPhase)
+        setFiles([])
+        setStatus({
+          ok: true,
+          text: queued
+            ? `Queued for processing${duplicates ? ` · ${duplicates} already known` : ''}`
+            : 'Already in your notes — nothing to do',
+        })
+      }
+    } catch (e) {
+      fail(e)
+    } finally {
+      setBusy(false)
+      setPhase('')
     }
   }
 
-  const canSave = tab === 'write' ? body.trim().length > 0 : files.length > 0
+  const canSave = !busy && (tab === 'write' ? body.trim().length > 0 : files.length > 0)
 
   return (
     <div style={{ position: 'fixed', inset: 0, zIndex: 200, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '0 16px' }}
@@ -854,10 +914,14 @@ function CaptureSheet({ onClose, onSave }: {
           )}
 
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: 16 }}>
-            {done ? (
-              <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: '#16a34a' }}>
-                <svg width="13" height="13" viewBox="0 0 24 24" fill="none"><path d="M20 6L9 17l-5-5" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" /></svg>
-                Queued for processing
+            {busy && phase ? (
+              <div style={{ fontSize: 12, color: '#64748b' }}>{phase}</div>
+            ) : status ? (
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: status.ok ? '#16a34a' : '#ef4444' }}>
+                {status.ok
+                  ? <svg width="13" height="13" viewBox="0 0 24 24" fill="none"><path d="M20 6L9 17l-5-5" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" /></svg>
+                  : <svg width="13" height="13" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="9" stroke="currentColor" strokeWidth="2" /><line x1="12" y1="7" x2="12" y2="13" stroke="currentColor" strokeWidth="2" strokeLinecap="round" /><line x1="12" y1="16.5" x2="12" y2="16.5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" /></svg>}
+                {status.text}
               </div>
             ) : <div />}
             <div style={{ display: 'flex', gap: 8 }}>
@@ -867,7 +931,7 @@ function CaptureSheet({ onClose, onSave }: {
               </button>
               <button onClick={save} disabled={!canSave}
                 style={{ padding: '9px 22px', background: canSave ? '#4f46e5' : '#f1f0ec', border: 'none', borderRadius: 9, color: canSave ? '#fff' : '#cbd5e1', fontSize: 13, fontWeight: 500, cursor: canSave ? 'pointer' : 'default', fontFamily: 'inherit', transition: 'background .15s' }}>
-                {tab === 'upload' ? `Upload ${files.length > 0 ? files.length + ' ' : ''}file${files.length !== 1 ? 's' : ''}` : 'Save note'}
+                {busy ? 'Working…' : tab === 'upload' ? `Upload ${files.length > 0 ? files.length + ' ' : ''}file${files.length !== 1 ? 's' : ''}` : 'Save note'}
               </button>
             </div>
           </div>
@@ -932,9 +996,138 @@ function TagPanel({ tagId, notes, isMobile, onClose, onOpenNote }: {
   )
 }
 
+// ─── Ingestion progress ───────────────────────────────────────────────────────
+const ITEM_STATE: Record<string, { label: string; color: string }> = {
+  pending:    { label: 'waiting',   color: '#cbd5e1' },
+  processing: { label: 'reading…',  color: '#4f46e5' },
+  ocr_done:   { label: 'read',      color: '#4f46e5' },
+  merged:     { label: 'in graph',  color: '#16a34a' },
+  duplicate:  { label: 'duplicate', color: '#cbd5e1' },
+  failed:     { label: 'failed',    color: '#ef4444' },
+}
+const MAX_ROWS = 40
+
+function IngestRow({ item, isLast }: { item: IngestItem; isLast: boolean }) {
+  const state = ITEM_STATE[item.status] ?? { label: item.status, color: '#94a3b8' }
+  return (
+    <div style={{ padding: '8px 14px', borderBottom: isLast ? 'none' : '1px solid #fafaf8' }}>
+      <div style={{ display: 'flex', gap: 10, alignItems: 'baseline' }}>
+        <div style={{ flex: 1, minWidth: 0, fontSize: 12, color: '#334155', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{item.name}</div>
+        <div style={{ fontSize: 11, color: state.color, flexShrink: 0 }}>{state.label}</div>
+      </div>
+      {item.error && (
+        <div style={{ fontSize: 11, color: '#ef4444', lineHeight: 1.4, marginTop: 2 }}>{item.error}</div>
+      )}
+    </div>
+  )
+}
+
+function IngestBadge({ isMobile, panelOpen, onBatchDone }: {
+  isMobile: boolean; panelOpen: boolean; onBatchDone: () => void
+}) {
+  const { shown, items, remaining, unseenFailures, settledKey, open, setOpen } = useIngest()
+  const wrapRef = useRef<HTMLDivElement>(null)
+
+  // A batch only writes its notes at the very end, so that is the moment the
+  // graph is stale. Refetch then rather than leaving it to a manual reload.
+  useEffect(() => { if (settledKey) onBatchDone() }, [settledKey, onBatchDone])
+
+  // Same dismissal rules as the search dropdown
+  useEffect(() => {
+    if (!open) return
+    const click = (e: MouseEvent) => {
+      if (wrapRef.current && !wrapRef.current.contains(e.target as Node)) setOpen(false)
+    }
+    const key = (e: KeyboardEvent) => { if (e.key === 'Escape') setOpen(false) }
+    document.addEventListener('mousedown', click)
+    window.addEventListener('keydown', key)
+    return () => { document.removeEventListener('mousedown', click); window.removeEventListener('keydown', key) }
+  }, [open, setOpen])
+
+  useEffect(() => { if (!remaining && !unseenFailures) setOpen(false) }, [remaining, unseenFailures, setOpen])
+  if (!remaining && !unseenFailures) return null
+
+  return (
+    <div ref={wrapRef} style={{
+      position: 'absolute',
+      top: isMobile ? `calc(54px + env(safe-area-inset-top))` : `calc(16px + env(safe-area-inset-top))`,
+      right: 16,
+      transform: `translateX(-${!isMobile && panelOpen ? 420 : 0}px)`,
+      transition: 'transform .28s cubic-bezier(.32,.72,0,1)',
+      zIndex: 30, pointerEvents: 'none',
+    }}>
+      <button onClick={() => setOpen(!open)}
+        style={{ display: 'flex', alignItems: 'center', gap: 6, background: '#4f46e5', borderRadius: 20, padding: '7px 18px', border: 'none', color: '#fff', fontSize: 13, fontWeight: 500, cursor: 'pointer', fontFamily: 'inherit', boxShadow: '0 2px 14px rgba(79,70,229,.4)', pointerEvents: 'auto', whiteSpace: 'nowrap', animation: 'popIn .2s cubic-bezier(.32,.72,0,1)' }}
+        onMouseEnter={e => (e.currentTarget as HTMLElement).style.background = '#4338ca'}
+        onMouseLeave={e => (e.currentTarget as HTMLElement).style.background = '#4f46e5'}
+      >
+        {remaining > 0 ? (
+          <svg width="11" height="11" viewBox="0 0 24 24" fill="none">
+            <circle cx="12" cy="12" r="9" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeDasharray="14 42" />
+          </svg>
+        ) : (
+          <svg width="11" height="11" viewBox="0 0 24 24" fill="none">
+            <circle cx="12" cy="12" r="9" stroke="currentColor" strokeWidth="2" />
+            <line x1="12" y1="7" x2="12" y2="13" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+            <line x1="12" y1="16.5" x2="12" y2="16.5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+          </svg>
+        )}
+        {remaining > 0 ? remaining : unseenFailures}
+      </button>
+
+      {open && (
+        <div style={{
+          position: 'absolute', top: 'calc(100% + 6px)', right: 0, width: 300,
+          background: 'rgba(255,255,255,.98)', backdropFilter: 'blur(16px)',
+          border: '1px solid #c7d2fe', borderRadius: 12,
+          boxShadow: '0 16px 40px rgba(0,0,0,.1)',
+          overflow: 'hidden', zIndex: 30, pointerEvents: 'auto',
+          animation: 'popIn .2s cubic-bezier(.32,.72,0,1)',
+          maxHeight: 'min(60vh, 420px)', overflowY: 'auto',
+        }}>
+          {shown.slice(0, 3).map(b => {
+            const settled = b.done + b.failed
+            const phase = batchPhase(b)
+            const rows = items.filter(i => i.batchId === b.id)
+            return (
+              <div key={b.id}>
+                <div style={{ padding: '10px 14px 8px', borderBottom: '1px solid #fafaf8' }}>
+                  <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', marginBottom: 6 }}>
+                    <span style={{ fontSize: 10, color: '#cbd5e1', textTransform: 'uppercase', letterSpacing: '.08em' }}>
+                      {PHASE_LABEL[phase]}
+                    </span>
+                    <span style={{ fontSize: 11, color: '#94a3b8' }}>
+                      {phase === 'organising' ? 'grouping into notes…' : `${settled} of ${b.total}`}
+                      {b.failed > 0 ? ` · ${b.failed} failed` : ''}
+                    </span>
+                  </div>
+                  <div style={{ height: 3, borderRadius: 2, background: '#f1f0ec', overflow: 'hidden' }}>
+                    <div style={{
+                      height: '100%', background: '#4f46e5', transition: 'width .3s ease',
+                      width: `${Math.round((settled / Math.max(1, b.total)) * 100)}%`,
+                      // A full bar with work left would read as finished; pulse instead.
+                      animation: phase === 'organising' ? 'pulse 1.4s ease-in-out infinite' : undefined,
+                    }} />
+                  </div>
+                </div>
+                {rows.slice(0, MAX_ROWS).map((i, n) => (
+                  <IngestRow key={i.id} item={i} isLast={n === Math.min(rows.length, MAX_ROWS) - 1} />
+                ))}
+                {rows.length > MAX_ROWS && (
+                  <div style={{ padding: '8px 14px', fontSize: 11, color: '#cbd5e1' }}>+{rows.length - MAX_ROWS} more</div>
+                )}
+              </div>
+            )
+          })}
+        </div>
+      )}
+    </div>
+  )
+}
+
 // ─── App ──────────────────────────────────────────────────────────────────────
 export default function App() {
-  const [notes, setNotes] = useState<Note[]>(SEED)
+  const { notes, refresh, update, remove, attachDoc, create } = useNotes()
   const [openNote, setOpenNote] = useState<Note | null>(null)
   const [openTag, setOpenTag] = useState<string | null>(null)
   const [focusId, setFocusId] = useState('')
@@ -953,20 +1146,25 @@ export default function App() {
   }, [notes])
 
   const handleUpdate = useCallback((id: string, content: string) => {
-    setNotes(p => p.map(n => n.id === id ? { ...n, content, modified: Date.now() } : n))
+    update(id, content)
     setOpenNote(p => p?.id === id ? { ...p, content, modified: Date.now() } : p)
-  }, [])
+  }, [update])
+
+  const handleDelete = useCallback((id: string) => {
+    setOpenNote(p => p?.id === id ? null : p)
+    setFocusId(f => f === id ? '' : f)
+    remove(id).catch(() => { /* the hook restores the note and reports it */ })
+  }, [remove])
 
   const handleAddDoc = useCallback((noteId: string, doc: NoteDoc) => {
-    setNotes(p => p.map(n => n.id === noteId ? { ...n, docs: [...(n.docs ?? []), doc] } : n))
+    attachDoc(noteId, doc)
     setOpenNote(p => p?.id === noteId ? { ...p, docs: [...(p.docs ?? []), doc] } : p)
-  }, [])
+  }, [attachDoc])
 
-  const handleSave = useCallback((name: string, content: string) => {
-    const n: Note = { id: `n${Date.now()}`, name, content, created: Date.now(), modified: Date.now() }
-    setNotes(p => [...p, n])
+  const handleSave = useCallback(async (name: string, content: string) => {
+    const n = await create(name, content)
     setOpenNote(n); setFocusId(n.id)
-  }, [])
+  }, [create])
 
   useEffect(() => {
     const h = (e: KeyboardEvent) => {
@@ -1047,10 +1245,13 @@ export default function App() {
         </button>
       </div>
 
+      <IngestBadge isMobile={isMobile} panelOpen={panelOpen} onBatchDone={refresh} />
+
       <NoteCard note={openNote} notes={notes} isMobile={isMobile}
         onClose={() => { setOpenNote(null); setFocusId('') }}
         onNavigate={id => { setOpenTag(null); openById(id) }}
         onUpdate={handleUpdate}
+        onDelete={handleDelete}
         onAddDoc={handleAddDoc}
       />
       <TagPanel tagId={openTag} notes={notes} isMobile={isMobile}
