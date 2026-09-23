@@ -1,0 +1,10 @@
+{
+  "description": "Organize and visualize markdown files with an interactive graph view to enhance note-taking and knowledge management for users.",
+  "robots": {
+    "index": false
+  },
+  "accessibility": {
+    "addBypassLinks": false,
+    "ignoreReducedMotion": false
+  }
+}
